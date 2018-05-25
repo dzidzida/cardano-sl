@@ -58,7 +58,10 @@ instance Bi User where
 module Pos.Binary.Class.TH
        ( deriveSimpleBi
        , deriveSimpleBiCxt
+       , deriveIndexedBi
+       , deriveIndexedBiCxt
        , Cons (..)
+       , Constr (..)
        , Field (Field)
        ) where
 
@@ -67,7 +70,9 @@ import           Universum
 import qualified Codec.CBOR.Decoding as Cbor
 import qualified Codec.CBOR.Encoding as Cbor
 import           Control.Lens (imap)
-import           Data.List (nubBy)
+import           Data.List (nubBy, (!!), (\\))
+import           Data.Maybe (listToMaybe)
+import           Data.Function (on)
 import           Formatting (sformat, shown, (%))
 import           Language.Haskell.TH
 import           TH.ReifySimple (DataCon (..), DataType (..), reifyDataType)
@@ -98,6 +103,14 @@ data Field
     -- ^ You're expected to write something like @[|foo :: Bar|]@ here
     }
 
+-- | Integer indexed constructors
+data Constr = Constr
+    {
+      constructorName :: Name
+    , constructorFields :: [Field]
+    }
+
+
 -- | Turn something like @[|foo :: Bar|]@ into @(foo, Bar)@.
 expToNameAndType :: ExpQ -> Q (Name, Type)
 expToNameAndType ex = ex >>= \case
@@ -108,6 +121,202 @@ expToNameAndType ex = ex >>= \case
 
 fieldToPair :: Field -> Q (Name, Maybe Type)
 fieldToPair (Field ex)  = over _2 Just <$> expToNameAndType ex
+
+fieldToIdxTypePair :: Field -> Q (Int, Type)
+fieldToIdxTypePair (Field ex) = ex >>= \case
+    SigE (LitE (IntegerL i)) t -> (,t) <$> checkTruncateInteger i
+    other                      -> templateHaskellError $
+        "fieldToIdxTypePair: expression should look like \
+        \[| idx :: Type |], where idx is an Int. got instead: "
+        <> show other
+
+checkTruncateInteger :: Integer -> Q Int
+checkTruncateInteger i = do
+    let trunc = fromIntegral i :: Int
+    if i == fromIntegral trunc
+       then return trunc
+       else templateHaskellError $
+           "Integer literal `" <> show i <> "` is out of Int range.\
+           \ It should be between 0 and 255"
+
+--------------------------------------------------------------------------------
+-- Indexed derivations
+--------------------------------------------------------------------------------
+deriveIndexedBi :: Name -> [Constr] -> Q [Dec]
+deriveIndexedBi = deriveIndexedBiInternal Nothing
+
+deriveIndexedBiCxt :: TypeQ -> Name -> [Constr] -> Q [Dec]
+deriveIndexedBiCxt = deriveIndexedBiInternal . Just
+
+deriveIndexedBiInternal :: Maybe TypeQ -> Name -> [Constr] -> Q [Dec]
+deriveIndexedBiInternal predsMB headTy constrs = do
+    when (null constrs) $
+        templateHaskellError "You passed no constructors to deriveIndexedBi"
+    when (length constrs > 255) $
+        templateHaskellError "You passed too many constructors to deriveIndexedBi"
+    when (length (nubBy ((==) `on` constructorName) constrs) /= length constrs) $
+        templateHaskellError "You passed two constructors with the same name"
+    preds <- maybe (pure []) (fmap one) predsMB
+    dt <- reifyDataType headTy
+    case matchAllConstructors (map constructorName constrs) (dtCons dt) of
+        MissedCons cons -> templateHaskellError $
+            sformat ("Constructor '"%shown%"' isn't passed to deriveIndexedBi") $
+            cons
+        UnknownCons cons -> templateHaskellError $
+            sformat ("Unknown constructor '"%shown%"' is passed to deriveIndexedBi") $
+            cons
+        MatchedCons matchedConstrs ->
+            forM_ (zip constrs matchedConstrs) $ \(constr, dataConstr) -> do
+                -- let Cons{..}, DataCon{..}
+                let conName = constructorName constr
+                    realFields = dcFields dataConstr
+                fieldIndicesAndTypes <- mapM fieldToIdxTypePair (constructorFields constr)
+                case checkAllIndexedFields fieldIndicesAndTypes realFields of
+                    MatchedFields -> return ()
+                    MissedField field -> templateHaskellError $
+                        sformat ("Field '"%shown%"' of the constructor '"
+                                %shown%"' isn't passed to deriveIndexedBi")
+                        field conName
+                    UnknownField field -> templateHaskellError $
+                        sformat ("Unknown field '"%shown%"' of the constructor '"
+                                %shown%"' is passed to deriveIndexedBi")
+                        field conName
+                    TypeMismatched field realType passedType -> templateHaskellError $
+                        sformat ("The type of '"%shown%"' of the constructor '"
+                                %shown%"' is mismatched: real type '"
+                                %shown%"', passed type '"%shown%"'")
+                        field conName realType passedType
+    ty <- conT headTy
+    makeBiInstanceTH preds ty <$> biEncodeExpr <*> biDecodeExpr
+  where
+    shortNameTy :: Text
+    shortNameTy = toText $ nameBase headTy
+
+    -- The type used to tag & distinguish constructors
+    tagType :: TypeQ
+    tagType = [t| Word8 |]
+
+    -- Decode definition --
+    biEncodeExpr :: Q Exp
+    biEncodeExpr = do
+        x <- newName "x"
+        lam1E (varP x) $
+          caseE (varE x) $
+              imap biEncodeConstr constrs
+
+    -- Generate the following code:
+    -- (Constr field_0 field_1 field_2)
+    --      -> encodeListLen 4
+    --      <> encode (3 :: Word8)
+    --      <> encode field_0
+    --      <> encode field_1
+    --      <> encode field_2
+    biEncodeConstr :: Int -> Constr -> MatchQ
+    biEncodeConstr ix (Constr name fields) = do
+
+        fieldIdxs <- mapM (\f -> fst <$> fieldToIdxTypePair f) fields
+
+        fieldIdxPairs <- mapM (\i -> (i,) <$> idxToFieldVar i) fieldIdxs
+        let -- We sort the indices so they match the fields of the constructor in order
+            sortedFieldIdxNames = map snd (sortOn fst fieldIdxPairs)
+            -- These we leave unsorted because the serialization order might not match
+            -- constructor order
+            fieldIdxNames = map snd fieldIdxPairs
+
+        match (conP name (map varP sortedFieldIdxNames))
+              (body fieldIdxNames)
+              []
+      where
+        body fieldIdxNames = normalB $
+            let (len, optTag) = if length constrs > 1
+                                   then (length fields + 1, [encodeTag ix])
+                                   else (length fields    , []            )
+            in  mconcatE (encodeFlat len : optTag ++ map encodeName fieldIdxNames)
+
+    idxToFieldVar :: Int -> Q Name
+    idxToFieldVar idx = newName ("field_" <> show idx)
+
+    -- Ensure the encoding of constructors with multiple arguments are encoded as a flat term.
+    encodeFlat :: Int -> Q Exp
+    encodeFlat listLen = [| Cbor.encodeListLen listLen |]
+
+    encodeTag :: Int -> Q Exp
+    encodeTag ix = [| Bi.encode (ix :: $tagType) |]
+
+    encodeName :: Name -> Q Exp
+    encodeName name =
+        [| Bi.encode $(varE name) |]
+
+    actualLen :: Name
+    actualLen = mkName "actualLen"
+
+    -- Decode definition --
+    biDecodeExpr :: Q Exp
+    biDecodeExpr = case constrs of
+        []     -> templateHaskellError $
+            sformat ("Attempting to decode type without constructors "%shown) headTy
+        [con] -> do
+          doE [ bindS (varP actualLen)  [| Cbor.decodeListLenCanonical |]
+              , noBindS (biDecodeConstr con) -- There is one constructor
+              ]
+        _      -> do
+            let tagName = mkName "tag"
+            let getMatch ix con = match (litP (IntegerL (fromIntegral ix)))
+                                              (normalB (biDecodeConstr con)) []
+            let mismatchConstr =
+                    match wildP (normalB
+                        [| cborError $ "Found invalid tag while decoding " <> shortNameTy |]) []
+            doE
+                [ bindS (varP actualLen)  [| Cbor.decodeListLenCanonical |]
+                , bindS (varP tagName)    [| Bi.decode |]
+                , noBindS (caseE
+                                (sigE (varE tagName) tagType)
+                                (imap getMatch constrs ++ [mismatchConstr]))
+                ]
+
+    biDecodeConstr :: Constr -> Q Exp
+    biDecodeConstr (Constr name fields) = do
+        let numFields            = length fields
+            expectedLen          = varE actualLen
+            prettyName :: String = show name
+            --  Given `n` fields, if this is the only constructor of this type, there
+            --  will be no tag, and we'll have a length `n` list. If there are multiple
+            --  constructors, we'll have a length `n+1` list (number of fields plus tag).
+            cborListLen :: Int   = if length constrs > 1 then numFields+1 else numFields
+
+        fieldIdxs <- mapM (\f -> fst <$> fieldToIdxTypePair f) fields
+
+        fieldIdxPairs <- mapM (\i -> (i,) <$> idxToFieldVar i) fieldIdxs
+        let -- We sort the indices so they match the fields of the constructor in order
+            sortedFieldIdxNames = map snd (sortOn fst fieldIdxPairs)
+            -- These we leave unsorted because the serialization order might not match
+            -- constructor order
+            fieldIdxNames = map snd fieldIdxPairs
+
+        varPs     :: [Pat]  <- mapM varP fieldIdxNames
+        decoders  :: [Exp]  <- replicateM (length varPs) [| Bi.decode |]
+        bindExprs :: [Stmt] <- zipWithM (\pat dec -> bindS (pure pat) (pure dec))
+                                            varPs
+                                            decoders
+        let lenCheck = noBindS [| Bi.matchSize cborListLen
+                                               ("biDecodeConstr@" <> prettyName)
+                                               $expectedLen
+                               |]
+        constructDatatype <- noBindS $ appE (varE 'pure)
+                                            (applyMultiArg (conE name)
+                                                           (map varE sortedFieldIdxNames))
+        doE $ lenCheck : map pure (bindExprs ++ [constructDatatype])
+
+
+-- Apply a multi-arg function application to a series of App's
+applyMultiArg :: ExpQ -> [ExpQ] -> Q Exp
+applyMultiArg f []     = f
+applyMultiArg f (x:xs) = applyMultiArg (appE f x) xs
+
+--------------------------------------------------------------------------------
+-- End Indexed
+--------------------------------------------------------------------------------
+
 
 -- Some part of code copied from
 -- https://hackage.haskell.org/package/store-0.4.3.1/docs/src/Data-Store-TH-Internal.html#makeStore
@@ -277,6 +486,7 @@ deriveSimpleBiInternal predsMB headTy constrs = do
                                 recWildUsedVars
         doE $ lenCheck : (map pure bindExprs ++ [pure recordWildCardReturn])
 
+
 makeBiInstanceTH :: Cxt -> Type -> Exp -> Exp -> [Dec]
 makeBiInstanceTH preds ty encodeE decodeE = one $
   plainInstanceD
@@ -296,6 +506,23 @@ data MatchConstructors
 
 matchAllConstrs :: [Cons] -> [DataCon] -> MatchConstructors
 matchAllConstrs (map cName -> passedNames) realCons@(map dcName -> realNames)
+    | Just nm <- passedNames `inclusion` realNames = UnknownCons nm
+    | Just nm <- realNames `inclusion` passedNames = MissedCons nm
+    | otherwise =
+        let ret = mapMaybe (\x -> find ((x==) . dcName) realCons) passedNames in
+        if length ret /= length passedNames then
+            error "Something went wrong. Matched list of constructors has different length"
+        else
+            MatchedCons ret
+  where
+    inclusion :: [Name] -> [Name] -> Maybe Name
+    inclusion c1 c2 = find (`notElem` c2) c1
+
+-- Duplicated code, because `matchAllConstrs`s definition is typed with `Cons` rather than
+-- using `Name`, which would be more flexible. `deriveSimpleBiInternal` can be redefined
+-- to use this, but we should be careful modifying that code until tests are more robust.
+matchAllConstructors :: [Name] -> [DataCon] -> MatchConstructors
+matchAllConstructors passedNames realCons@(map dcName -> realNames)
     | Just nm <- passedNames `inclusion` realNames = UnknownCons nm
     | Just nm <- realNames `inclusion` passedNames = MissedCons nm
     | otherwise =
@@ -338,6 +565,41 @@ checkAllFields passedFields realFields
 
     inclusion :: [Name] -> [Name] -> Maybe Name
     inclusion c1 c2 = find (`notElem` c2) c1
+
+checkAllIndexedFields :: [(Int, Type)] -> [(Maybe Name, Type)] -> MatchFields
+checkAllIndexedFields passedFields realFields
+    | Just nm <- inclusion (map fst passedFields) = UnknownField nm
+    | Just nm <- exclusion (map fst passedFields) = MissedField nm
+    | otherwise =
+        case dropWhile checkTypes (zip passedFields realFields) of
+            []                             -> MatchedFields
+            (((idx, passed), (_, real)):_) -> TypeMismatched (indexToName idx) real passed
+  where
+    checkTypes :: ((Int, Type), (Maybe Name, Type)) -> Bool
+    checkTypes ((_, t1), (_, t2)) = t1 == t2
+
+    -- find the first out-of-range index, and return it wrapped as a name
+    inclusion :: [Int] -> Maybe Name
+    inclusion is = indexToName <$> find (not . inRange) is
+
+    exclusion :: [Int] -> Maybe Name
+    exclusion is = do
+        let realIdxs = [0 .. length realFields - 1]
+        excludedIdx <- listToMaybe (realIdxs \\ is)
+        return (indexToName excludedIdx)
+
+    -- Because we may not have named fields, we try to find a name, and otherwise
+    -- render the index directly.
+    indexToName :: Int -> Name
+    indexToName idx
+      | inRange idx = case (map fst realFields) !! idx of
+                        Just nm -> nm
+                        Nothing -> mkName (show idx)
+      | otherwise = mkName (show idx)
+
+    -- check that an index is within valid range: (0, len(realFields)]
+    inRange :: Int -> Bool
+    inRange idx = 0 <= idx && idx < length realFields
 
 ----------------------------------------------------------------------------
 -- Utilities
