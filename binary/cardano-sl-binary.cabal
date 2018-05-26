@@ -127,6 +127,7 @@ test-suite test
                      , safecopy
                      , serokell-util >= 0.1.3.4
                      , tagged
+                     , template-haskell
                      , text
                      , text-format
                      , time-units
